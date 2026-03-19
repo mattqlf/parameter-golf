@@ -69,6 +69,7 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
+    use_rope = bool(int(os.environ.get("USE_ROPE", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
@@ -562,6 +563,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        use_rope: bool = True,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -571,7 +573,8 @@ class CausalSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
-        if self.head_dim % 2 != 0:
+        self.use_rope = use_rope
+        if use_rope and self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
@@ -580,7 +583,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.rotary = Rotary(self.head_dim, base=rope_base) if use_rope else None
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -589,9 +592,10 @@ class CausalSelfAttention(nn.Module):
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
-        cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        if self.use_rope:
+            cos, sin = self.rotary(seqlen, x.device, q.dtype)
+            q = apply_rotary_emb(q, cos, sin)
+            k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
@@ -628,11 +632,12 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        use_rope: bool = True,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, use_rope=use_rope)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -661,6 +666,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        use_rope: bool = True,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -682,6 +688,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    use_rope=use_rope,
                 )
                 for i in range(num_layers)
             ]
@@ -768,9 +775,9 @@ def eval_val_sliding(
     seq_len = args.train_seq_len
     total_tokens = val_tokens.numel() - 1
 
-    # Build windows; skip any too short to score a full stride
+    # Build windows; include the final partial window if it has at least 1 token
     window_starts = [ws for ws in range(0, total_tokens, stride)
-                     if min(ws + seq_len, total_tokens) - ws >= stride]
+                     if min(ws + seq_len, total_tokens) - ws >= 1]
     total_windows = len(window_starts)
 
     # Distribute across ranks
@@ -811,7 +818,7 @@ def eval_val_sliding(
 
             for i, ws in enumerate(batch_ws):
                 wlen = wlens[i]
-                s = 0 if ws == 0 else wlen - stride
+                s = 0 if ws == 0 else max(wlen - stride, 0)
                 scored_nll = nll[i, s:wlen].to(torch.float64)
                 loss_sum += scored_nll.sum()
                 token_count += float(wlen - s)
@@ -954,6 +961,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        use_rope=args.use_rope,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1015,7 +1023,7 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} use_rope:{args.use_rope}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
